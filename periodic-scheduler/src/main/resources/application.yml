@@ -1,0 +1,41 @@
+spring:
+  application:
+    name: periodic-scheduler
+  datasource:
+    # Default: self-contained in-memory H2 (demo / tests).
+    # Production: activate the "postgres" profile or override DATABASE_URL.
+    url: ${DATABASE_URL:jdbc:h2:mem:scheduler;DB_CLOSE_DELAY=-1}
+    username: ${DATABASE_USER:sa}
+    password: ${DATABASE_PASSWORD:}
+    driver-class-name: ${DATABASE_DRIVER:org.h2.Driver}
+  flyway:
+    enabled: true
+  quartz:
+    job-store-type: memory
+    auto-startup: true
+    properties:
+      org.quartz.scheduler.instanceName: periodic-scheduler
+      org.quartz.threadPool.threadCount: 4
+
+server:
+  port: 8080
+
+app:
+  # Identity of this scheduler process. Must be unique per process when several
+  # schedulers share one database (see scripts/start-two-nodes.sh).
+  node-id: ${APP_NODE_ID:local}
+  planner:
+    # How far ahead trigger instances are materialized into trigger_instance.
+    horizon: P7D
+    tick: PT30S
+    # Safety valve against pathological frequency/horizon combinations.
+    max-occurrences-per-run: 100000
+  dispatcher:
+    tick: PT2S
+    batch-size: 50
+    lease-ttl: PT30S
+    retry-backoff: PT10S
+
+logging:
+  level:
+    com.example.scheduler: INFO
