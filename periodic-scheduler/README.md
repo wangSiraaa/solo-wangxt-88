@@ -45,7 +45,7 @@ Spring Boot + Quartz + PostgreSQL 的周期任务 API。核心设计：**"每天
 
 ## 3. 数据模型（PostgreSQL，Flyway 迁移）
 
-- `schedule_definition` — 调度定义（类型、cron/时区 或 间隔/锚点、DST 策略、maxRetries、`materialized_until` 物化水位线）。
+- `schedule_definition` — 调度定义（类型、cron/时区 或 间隔/锚点、DST 策略、maxRetries）。
 - `trigger_instance` — 触发实例。`(definition_id, occurrence_key)` 唯一：物化幂等，N 个规划进程并发也不会产生重复实例。`scheduled_at_utc`（可空）、`sort_at`、`original_zone`、`local_time`、`utc_offset`、`status`、`skip_reason`、`retry_count`、`next_retry_at`。
 - `execution_lease` — 执行租约。**`instance_id` 为主键：一个实例至多存在一条租约记录**。
 - `pause_window` — 暂停窗口 `[from_ts, to_ts)`，`to_ts` 为 NULL 表示无限期。
@@ -81,16 +81,9 @@ Spring Boot + Quartz + PostgreSQL 的周期任务 API。核心设计：**"每天
 
 全服务唯一时间源是 `Clock` bean（`config/AppConfig.java`）。测试用 `MutableClock` 替换（`@Primary`），因此闰日、夏令时切换、暂停恢复都是确定性验证。租约过期等判断全部使用该时钟，不依赖数据库时钟。
 
-## 8. Quartz 的角色与滚动物化
+## 8. Quartz 的角色
 
-Quartz 是**进程内 tick 源**：`PlannerJob`（默认 30s）驱动物化；`DispatcherJob`（默认 2s）租取到期实例并执行。跨进程正确性**不依赖** Quartz，全部由数据库约束保证（唯一 occurrence key、单租约行、状态守卫）。如需让 tick 本身也集群化，可把 `spring.quartz.job-store-type` 切到 `jdbc` —— 上述保证不变。
-
-**滚动物化**：物化不是一次性填满整个视界，而是分批推进——每次运行最多为每个定义插入 `app.planner.batch-size`（默认 10000）条实例，并把进度写入 `schedule_definition.materialized_until` 水位线；下一批从水位线继续向 `now + horizon` 推进。因此：
-
-- 任何频率（最小 1 秒）的任务都能在**默认配置**下创建（7 天视界 × 3 秒 = 201600 条，分 21 批填平）；
-- 创建时同步物化第一批，立即可执行；后续批次由 planner tick 补齐，物化速度远快于时间流逝，执行不会断供；
-- 日历类批次在**日边界**截断（保证水位线续算安全），水位线只前进不后退（守卫更新），并发 planner 不会互相回退；
-- 预览接口 `preview` 仍是纯计算，与物化进度无关。
+Quartz 是**进程内 tick 源**：`PlannerJob`（默认 30s）把定义物化为未来 7 天的实例；`DispatcherJob`（默认 2s）租取到期实例并执行。跨进程正确性**不依赖** Quartz，全部由数据库约束保证（唯一 occurrence key、单租约行、状态守卫）。如需让 tick 本身也集群化，可把 `spring.quartz.job-store-type` 切到 `jdbc` —— 上述保证不变。
 
 ## 9. API 一览（`/api/v1`）
 
@@ -168,7 +161,7 @@ POSTGRES_PASSWORD=CHANGE_ME docker compose up --build
 mvn test
 ```
 
-47 个测试，重点不是"算一次下次运行时间"，而是**整段未来实例集合**的预期 vs 实际比对：
+44 个测试，重点不是"算一次下次运行时间"，而是**整段未来实例集合**的预期 vs 实际比对：
 
 - `FutureInstanceSetVerificationIT` — 通过 REST API 拉取整段窗口的实例集合，与独立计算的预期集合做**多重集比对**，打印完整差异报告（`EXPECTED-ONLY` / `ACTUAL-ONLY`）：
   - 闰日：`0 0 9 29 2 *` 在 2027..2032 只在 2028、2032 触发；`L` 月末规则覆盖 2 月 28/29；
@@ -176,7 +169,6 @@ mvn test
   - DST 重叠：`FIRST`/`SECOND`/`BOTH`；
   - 固定间隔 vs 日历：同一锚点跨夏令时产生**不同**的 UTC 触发集合；
   - 暂停/恢复：窗口内 `PAUSED`、窗口外正常、恢复不回补、物化集合与预览集合一致。
-- `RollingMaterializationIT` / `RollingCalendarMaterializationIT` / `DefaultConfigHighFrequencyIT` — 滚动物化：小批次逐批推进、水位线单调前进、日边界截断、批次间无重复；**默认配置**（P7D / 10000）下 3 秒任务可创建且实例不越出视界。
 - `OccurrenceEngineTest` — 引擎层 4 年（1461 天、8 次 DST 切换）全集合与独立暴力计算逐点相等。
 - `LeaseConcurrencyIT` — 16 线程争抢同一实例仅 1 个获租约；过期租约 fencing token 失效；两个 dispatcher 竞争同一实例只执行一次。
 - `RetryIdentityIT` — 重试复用实例 id、计划实例数不变、退避生效、超限进入终态。

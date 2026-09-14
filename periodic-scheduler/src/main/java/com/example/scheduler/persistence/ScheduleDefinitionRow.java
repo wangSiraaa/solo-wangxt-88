@@ -18,6 +18,5 @@ public record ScheduleDefinitionRow(UUID id,
                                     DstOverlapPolicy dstOverlapPolicy,
                                     int maxRetries,
                                     Instant createdAt,
-                                    Instant updatedAt,
-                                    Instant materializedUntil) {
+                                    Instant updatedAt) {
 }

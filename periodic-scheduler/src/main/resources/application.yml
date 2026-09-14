@@ -28,10 +28,8 @@ app:
     # How far ahead trigger instances are materialized into trigger_instance.
     horizon: P7D
     tick: PT30S
-    # Rolling materialization: each planner run inserts at most this many occurrences
-    # per definition and remembers progress in schedule_definition.materialized_until.
-    # Any frequency (down to 1s) is accepted; the horizon is filled incrementally.
-    batch-size: 10000
+    # Safety valve against pathological frequency/horizon combinations.
+    max-occurrences-per-run: 100000
   dispatcher:
     tick: PT2S
     batch-size: 50

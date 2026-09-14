@@ -28,8 +28,7 @@ public class ScheduleRepository {
             DstOverlapPolicy.valueOf(rs.getString("dst_overlap_policy")),
             rs.getInt("max_retries"),
             rs.getTimestamp("created_at").toInstant(),
-            rs.getTimestamp("updated_at").toInstant(),
-            toInstant(rs.getTimestamp("materialized_until")));
+            rs.getTimestamp("updated_at").toInstant());
 
     private final JdbcTemplate jdbc;
 
@@ -41,23 +40,11 @@ public class ScheduleRepository {
         jdbc.update("""
                         INSERT INTO schedule_definition
                           (id, name, schedule_type, cron_expression, timezone, interval_seconds, anchor_at,
-                           dst_gap_policy, dst_overlap_policy, max_retries, created_at, updated_at,
-                           materialized_until)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                           dst_gap_policy, dst_overlap_policy, max_retries, created_at, updated_at)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 r.id().toString(), r.name(), r.type().name(), r.cronExpression(), r.timezone(),
                 r.intervalSeconds(), ts(r.anchorAt()), r.dstGapPolicy().name(), r.dstOverlapPolicy().name(),
-                r.maxRetries(), ts(r.createdAt()), ts(r.updatedAt()), ts(r.materializedUntil()));
-    }
-
-    /**
-     * Advances the materialization watermark monotonically (never moves it backwards, so
-     * concurrent planner processes cannot regress each other's progress).
-     */
-    public int advanceMaterializedUntil(UUID id, Instant watermark, Instant now) {
-        return jdbc.update("""
-                        UPDATE schedule_definition SET materialized_until = ?, updated_at = ?
-                        WHERE id = ? AND (materialized_until IS NULL OR materialized_until < ?)""",
-                ts(watermark), ts(now), id.toString(), ts(watermark));
+                r.maxRetries(), ts(r.createdAt()), ts(r.updatedAt()));
     }
 
     public Optional<ScheduleDefinitionRow> findById(UUID id) {
