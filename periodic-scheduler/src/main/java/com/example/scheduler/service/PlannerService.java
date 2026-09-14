@@ -4,7 +4,6 @@ import com.example.scheduler.calendar.CronSpec;
 import com.example.scheduler.calendar.Occurrence;
 import com.example.scheduler.calendar.OccurrenceEngine;
 import com.example.scheduler.domain.InstanceStatus;
-import com.example.scheduler.domain.ScheduleType;
 import com.example.scheduler.persistence.InstanceRepository;
 import com.example.scheduler.persistence.PauseWindowRepository;
 import com.example.scheduler.persistence.PauseWindowRow;
@@ -25,9 +24,19 @@ import java.util.List;
 import java.util.UUID;
 
 /**
- * Turns schedule definitions into trigger instances. Materialization is idempotent across any
- * number of concurrent planner processes: the occurrence key is stable and
- * {@code (definition_id, occurrence_key)} is unique, so racing planners insert nothing twice.
+ * Turns schedule definitions into trigger instances.
+ *
+ * <p><b>Rolling materialization.</b> Each run materializes at most {@code batch-size}
+ * occurrences of a definition and stores how far it got in
+ * {@code schedule_definition.materialized_until}. The next run continues from that watermark
+ * towards {@code now + horizon}. Any frequency (down to 1 second) is therefore accepted at
+ * creation time — the horizon is filled incrementally instead of in one giant transaction.
+ *
+ * <p><b>Idempotent under concurrency.</b> The occurrence key is stable and
+ * {@code (definition_id, occurrence_key)} is unique, so racing planner processes insert
+ * nothing twice; the watermark only moves forward (guarded update), so a stale process
+ * cannot regress it. A regressed/lagging watermark is harmless anyway: re-computed
+ * occurrences are no-ops.
  */
 @Service
 public class PlannerService {
@@ -40,7 +49,7 @@ public class PlannerService {
     private final OccurrenceEngine engine;
     private final Clock clock;
     private final Duration horizon;
-    private final int maxOccurrencesPerRun;
+    private final int batchSize;
 
     public PlannerService(ScheduleRepository schedules,
                           InstanceRepository instances,
@@ -48,38 +57,52 @@ public class PlannerService {
                           OccurrenceEngine engine,
                           Clock clock,
                           @Value("${app.planner.horizon:P7D}") Duration horizon,
-                          @Value("${app.planner.max-occurrences-per-run:100000}") int maxOccurrencesPerRun) {
+                          @Value("${app.planner.batch-size:10000}") int batchSize) {
+        if (batchSize < 1) {
+            throw new IllegalArgumentException("app.planner.batch-size must be >= 1");
+        }
         this.schedules = schedules;
         this.instances = instances;
         this.pauseWindows = pauseWindows;
         this.engine = engine;
         this.clock = clock;
         this.horizon = horizon;
-        this.maxOccurrencesPerRun = maxOccurrencesPerRun;
+        this.batchSize = batchSize;
     }
 
-    /** Materialize occurrences of one definition over [now, now + horizon]. */
+    /**
+     * Materialize the next batch of occurrences of one definition, advancing its
+     * watermark towards {@code now + horizon}. Returns how many rows were inserted.
+     */
     @Transactional
     public int materializeFor(UUID definitionId) {
         return schedules.findById(definitionId).map(def -> {
             Instant now = clock.instant();
-            List<Occurrence> occurrences = occurrencesFor(def, now.minusSeconds(1), now.plus(horizon));
-            if (occurrences.size() > maxOccurrencesPerRun) {
-                throw new IllegalStateException("definition " + definitionId + " would materialize "
-                        + occurrences.size() + " occurrences within horizon " + horizon
-                        + " (limit " + maxOccurrencesPerRun + "); shorten the horizon or the frequency");
+            Instant target = now.plus(horizon);
+            Instant from = def.materializedUntil() != null
+                    ? def.materializedUntil()
+                    : now.minusSeconds(1);
+            if (!from.isBefore(target)) {
+                return 0; // horizon already covered
             }
+            OccurrenceEngine.OccurrencePage page = computePage(def, from, target);
+            List<Occurrence> occurrences = applyPauseWindows(page.occurrences(),
+                    pauseWindows.findByDefinition(def.id()));
             int inserted = 0;
             for (Occurrence occ : occurrences) {
                 if (instances.insertIgnore(toRow(def, occ, now))) {
                     inserted++;
                 }
             }
+            Instant watermark = page.truncated()
+                    ? page.occurrences().get(page.occurrences().size() - 1).sortInstant()
+                    : target;
+            schedules.advanceMaterializedUntil(def.id(), watermark, now);
             return inserted;
         }).orElse(0);
     }
 
-    /** Materialize all definitions and reconcile pause windows. Per-definition failures are isolated. */
+    /** Materialize all definitions (one batch each) and reconcile pause windows. */
     public int materializeAll() {
         int total = 0;
         for (ScheduleDefinitionRow def : schedules.findAll()) {
@@ -101,10 +124,6 @@ public class PlannerService {
 
     /** Pure computation for the preview endpoint: occurrences with the pause overlay applied. */
     public List<Occurrence> previewFor(ScheduleDefinitionRow def, Instant fromExclusive, Instant toInclusive) {
-        return occurrencesFor(def, fromExclusive, toInclusive);
-    }
-
-    private List<Occurrence> occurrencesFor(ScheduleDefinitionRow def, Instant fromExclusive, Instant toInclusive) {
         List<Occurrence> occurrences = switch (def.type()) {
             case CALENDAR -> engine.calendarOccurrences(
                     CronSpec.parse(def.cronExpression()), ZoneId.of(def.timezone()),
@@ -113,6 +132,16 @@ public class PlannerService {
                     def.anchorAt(), def.intervalSeconds(), fromExclusive, toInclusive);
         };
         return applyPauseWindows(occurrences, pauseWindows.findByDefinition(def.id()));
+    }
+
+    private OccurrenceEngine.OccurrencePage computePage(ScheduleDefinitionRow def, Instant from, Instant to) {
+        return switch (def.type()) {
+            case CALENDAR -> engine.calendarOccurrencesPage(
+                    CronSpec.parse(def.cronExpression()), ZoneId.of(def.timezone()),
+                    from, to, def.dstGapPolicy(), def.dstOverlapPolicy(), batchSize);
+            case FIXED_INTERVAL -> engine.intervalOccurrencesPage(
+                    def.anchorAt(), def.intervalSeconds(), from, to, batchSize);
+        };
     }
 
     private List<Occurrence> applyPauseWindows(List<Occurrence> occurrences, List<PauseWindowRow> windows) {

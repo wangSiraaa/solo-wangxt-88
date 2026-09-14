@@ -27,25 +27,54 @@ import java.util.Objects;
  *
  * <p>Fixed-interval occurrences are pure arithmetic on the UTC timeline
  * ({@code anchor + k * interval}); wall-clock rules never apply.
+ *
+ * <p>The {@code *Page} variants support rolling materialization: they return at most
+ * {@code limit} occurrences and report whether more remain in the window, so the planner
+ * can fill the horizon in batches. Calendar pages are cut at day boundaries — every
+ * occurrence of a started day is included, which keeps the continuation watermark safe
+ * (all not-yet-returned occurrences sort strictly after the page's last sort instant).
  */
 public final class OccurrenceEngine {
 
-    /** Safety bound for interval materialization windows. */
-    public static final int MAX_INTERVAL_OCCURRENCES = 1_000_000;
+    /** Safety bound for unbounded (preview) computations. */
+    public static final int MAX_OCCURRENCES = 1_000_000;
+
+    /** A page of occurrences plus whether the window holds more beyond it. */
+    public record OccurrencePage(List<Occurrence> occurrences, boolean truncated) {
+    }
+
+    // ---------------------------------------------------------------- calendar
 
     public List<Occurrence> calendarOccurrences(CronSpec spec, ZoneId zone,
                                                 Instant fromExclusive, Instant toInclusive,
                                                 DstGapPolicy gapPolicy, DstOverlapPolicy overlapPolicy) {
+        OccurrencePage page = calendarOccurrencesPage(spec, zone, fromExclusive, toInclusive,
+                gapPolicy, overlapPolicy, MAX_OCCURRENCES);
+        if (page.truncated()) {
+            throw new IllegalArgumentException("calendar schedule produces more than "
+                    + MAX_OCCURRENCES + " occurrences in the requested window");
+        }
+        return page.occurrences();
+    }
+
+    public OccurrencePage calendarOccurrencesPage(CronSpec spec, ZoneId zone,
+                                                  Instant fromExclusive, Instant toInclusive,
+                                                  DstGapPolicy gapPolicy, DstOverlapPolicy overlapPolicy,
+                                                  int limit) {
         Objects.requireNonNull(spec, "spec");
         Objects.requireNonNull(zone, "zone");
+        if (limit <= 0) {
+            throw new IllegalArgumentException("limit must be > 0");
+        }
         if (!toInclusive.isAfter(fromExclusive)) {
-            return List.of();
+            return new OccurrencePage(List.of(), false);
         }
         ZoneRules rules = zone.getRules();
         LocalDate startDay = fromExclusive.atZone(zone).toLocalDate();
         LocalDate endDay = toInclusive.atZone(zone).toLocalDate();
         List<Occurrence> out = new ArrayList<>();
         int[] timesOfDay = spec.secondsOfDay();
+        boolean truncated = false;
         for (LocalDate day = startDay; !day.isAfter(endDay); day = day.plusDays(1)) {
             if (!spec.matchesDay(day)) {
                 continue;
@@ -65,9 +94,24 @@ public final class OccurrenceEngine {
                     }
                 }
             }
+            if (out.size() >= limit) {
+                // Cut at the day boundary: every occurrence of this day is in the page.
+                // Truncated iff at least one further matching day remains in the window.
+                truncated = hasMatchingDayAfter(spec, day, endDay);
+                break;
+            }
         }
         out.sort(Comparator.comparing(Occurrence::sortInstant).thenComparing(Occurrence::occurrenceKey));
-        return out;
+        return new OccurrencePage(out, truncated);
+    }
+
+    private static boolean hasMatchingDayAfter(CronSpec spec, LocalDate day, LocalDate endDay) {
+        for (LocalDate d = day.plusDays(1); !d.isAfter(endDay); d = d.plusDays(1)) {
+            if (spec.matchesDay(d)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Local time falls in a spring-forward gap: it does not exist. */
@@ -111,6 +155,8 @@ public final class OccurrenceEngine {
         }
     }
 
+    // ---------------------------------------------------------------- interval
+
     /**
      * Occurrences of a fixed-interval schedule: {@code anchor + k * intervalSeconds} for
      * integer k, strictly after {@code fromExclusive}, up to and including {@code toInclusive}.
@@ -118,32 +164,47 @@ public final class OccurrenceEngine {
      */
     public List<Occurrence> intervalOccurrences(Instant anchor, long intervalSeconds,
                                                 Instant fromExclusive, Instant toInclusive) {
+        OccurrencePage page = intervalOccurrencesPage(anchor, intervalSeconds,
+                fromExclusive, toInclusive, MAX_OCCURRENCES);
+        if (page.truncated()) {
+            throw new IllegalArgumentException("interval schedule produces more than "
+                    + MAX_OCCURRENCES + " occurrences in the requested window");
+        }
+        return page.occurrences();
+    }
+
+    public OccurrencePage intervalOccurrencesPage(Instant anchor, long intervalSeconds,
+                                                  Instant fromExclusive, Instant toInclusive, int limit) {
         if (intervalSeconds <= 0) {
             throw new IllegalArgumentException("intervalSeconds must be > 0");
         }
+        if (limit <= 0) {
+            throw new IllegalArgumentException("limit must be > 0");
+        }
         if (!toInclusive.isAfter(fromExclusive)) {
-            return List.of();
+            return new OccurrencePage(List.of(), false);
         }
         long anchorEpoch = anchor.getEpochSecond();
         long fromEpoch = fromExclusive.getEpochSecond();
         long toEpoch = toInclusive.getEpochSecond();
         long firstK = anchorEpoch > fromEpoch ? 0 : (fromEpoch - anchorEpoch) / intervalSeconds + 1;
-        List<Occurrence> out = new ArrayList<>();
+        List<Occurrence> out = new ArrayList<>(Math.min(limit, 100_000));
+        boolean truncated = false;
         for (long k = firstK; ; k++) {
             long t = anchorEpoch + k * intervalSeconds;
             if (t > toEpoch) {
+                break;
+            }
+            if (out.size() == limit) {
+                truncated = true; // a (limit+1)-th occurrence exists inside the window
                 break;
             }
             Instant instant = Instant.ofEpochSecond(t);
             ZonedDateTime z = instant.atZone(ZoneOffset.UTC);
             out.add(new Occurrence(instant, z.toLocalDateTime(), ZoneOffset.UTC, "UTC",
                     null, "I|" + instant, instant));
-            if (out.size() > MAX_INTERVAL_OCCURRENCES) {
-                throw new IllegalArgumentException("interval schedule produces more than "
-                        + MAX_INTERVAL_OCCURRENCES + " occurrences in the requested window");
-            }
         }
-        return out;
+        return new OccurrencePage(out, truncated);
     }
 
     private static boolean inWindow(Instant instant, Instant fromExclusive, Instant toInclusive) {

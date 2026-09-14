@@ -67,14 +67,11 @@ public class ScheduleService {
                 req.dstGapPolicy() != null ? req.dstGapPolicy() : DstGapPolicy.SHIFT_FORWARD,
                 req.dstOverlapPolicy() != null ? req.dstOverlapPolicy() : DstOverlapPolicy.FIRST,
                 req.maxRetries() != null ? req.maxRetries() : 3,
-                now, now);
+                now, now, null);
         schedules.insert(row);
-        try {
-            planner.materializeFor(row.id());
-        } catch (IllegalStateException e) {
-            // e.g. the schedule would materialize more occurrences than the horizon limit
-            throw new BadRequestException(e.getMessage());
-        }
+        // First rolling batch inline so the schedule has due instances immediately;
+        // the remaining horizon is filled by planner ticks (see PlannerService).
+        planner.materializeFor(row.id());
         return toView(row, false);
     }
 
